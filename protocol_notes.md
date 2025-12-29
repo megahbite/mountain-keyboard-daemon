@@ -23,9 +23,23 @@
         |80|00|00|01|00|00|00|00|00|00|00|00| <- IN             |
         |84|00|00|00|00|00|00|00|00|00|00|00| -> OUT            |
         |84|00|00|00|00|00|00|00|00|00|01|00| -> IN             |
-        |84|00|01|00|00|00|XX|XX|XX|XX|01|00| -> OUT            |
-        |84|00|01|00|00|00|XX|XX|XX|XX|01|00| -> IN             |
+        |84|00|01|00|00|XX|XX|XX|XX|XX|01|00| -> OUT            |
+        |84|00|01|00|00|XX|XX|XX|XX|XX|01|00| -> IN             |
 
-        0x84 seems to give a 32bit time stamp update to the device.
+        ~~0x84 seems to give a 32bit time stamp update to the device.~~
+        
+        There are 5 bytes of changing data so now I'm not sure. It possibly is a full 64bit, covering from the 2nd byte to the 9th, or less likely from the 3rd to the 10th.
+        
+        ~~Unix Epoch doesn't make a lot of sense here, so probably from 1900 (Windows Epoch).~~
+        
+        It's even more mundane than I expected. It's not an epoch, simply 5 bytes for:
+        * Month: 0x01-0x0C (it wraps from testing)
+        * Day: 0x01-0x1F (yes you can have February 31st)
+        * Hour: 0x00-0x17 (24hr time)
+        * Minute: 0x00-0x3B
+        * Seconds: 0x00-0x3B (not displayed but it will updated the time on its own based on this)
+
+        Not data efficient and a pain to convert to, but would be extremely simple to display and means an embedded system wouldn't need to care about datetime complexities.
+
 * Weird gotcha in that you have to send an IN interrupt before you push any data to OUT in order to get a response from the device. Sending it post packet doesn't seem to work. Also have to have two in-flight or it just never replies.
 * 0x81 and 0x83 seem related to the display dial. I think hardware stats and volume display.

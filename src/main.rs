@@ -18,6 +18,13 @@ enum State
     Handshook
 }
 
+enum HandshakeState
+{
+    Initial,
+    WithoutTimestamp,
+    WithTimestamp
+}
+
 #[tokio::main]
 async fn main() {
     if let Ok(mut devices) = list_devices().await {
@@ -111,19 +118,72 @@ async fn do_thing(mut reader: Endpoint<Interrupt, In>, mut writer: EndpointWrite
                     },
                     State::Handshake => 
                     {
-                        tx_write2.send(api::command::build_packet(api::command::HandshakePacket::new())).await.unwrap();
-                        loop
+                        let mut handshake_state = HandshakeState::Initial;
+                        'handshake: loop 
                         {
-                            if let Some(data) = rx.recv().await
+                            match handshake_state
                             {
-                                if data[1] == 0x80
+                                HandshakeState::Initial => 
                                 {
-                                    println!("Got handshake ack!");
+                                    tx_write2.send(api::command::build_packet(api::command::HandshakePacket::new())).await.unwrap();
+                                    loop
+                                    {
+                                        if let Some(data) = rx.recv().await
+                                        {
+                                            if data[1] == 0x80
+                                            {
+                                                println!("Got handshake ack!");
+                                                handshake_state = HandshakeState::WithoutTimestamp;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
+                                HandshakeState::WithoutTimestamp => 
+                                {
+                                    tx_write2.send(api::command::build_packet(api::command::HandshakeTimestampPacket::new(false))).await.unwrap();
+                                    loop
+                                    {
+                                        if let Some(data) = rx.recv().await
+                                        {
+                                            if data[1] == 0x84
+                                            {
+                                                println!("Got second handshake ack!");
+                                                handshake_state = HandshakeState::WithTimestamp;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
+                                HandshakeState::WithTimestamp => 
+                                {
+                                    tx_write2.send(api::command::build_packet(api::command::HandshakeTimestampPacket::new(true))).await.unwrap();
+                                    loop
+                                    {
+                                        if let Some(data) = rx.recv().await
+                                        {
+                                            if data[1] == 0x84
+                                            {
+                                                println!("Got third handshake ack!");
+                                                state = State::Handshook;
+                                                break 'handshake;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
+                        
                     },
-                    State::Handshook => {}
+                    State::Handshook => 
+                    {
+                        loop
+                        {
+                            if let Some(_data) = rx.recv().await
+                            {
+                            }
+                        }
+                    }
                 }
             }
         }

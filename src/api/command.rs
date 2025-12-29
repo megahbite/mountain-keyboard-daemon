@@ -1,3 +1,4 @@
+use chrono::{DateTime, Datelike, Local, Timelike};
 use nusb::transfer::Interrupt;
 use tokio::io::AsyncWriteExt;
 use nusb::io::EndpointWrite;
@@ -30,6 +31,56 @@ impl Packet for HandshakePacket
 
     fn get_op_code(&self) -> &'static u8 { &0x80 }
 
+    fn get_data(&self) -> &[u8; 62] { &self.data }
+}
+
+pub struct HandshakeTimestampPacket
+{
+    data: [u8; 62]
+}
+
+fn format_date(dt: &DateTime<Local>) -> [u8; 5]
+{
+    let month = dt.month();
+    let month: u8 = month.try_into().unwrap_or(0);
+
+    let day = dt.day();
+    let day: u8 = day.try_into().unwrap_or(0);
+
+    let hour = dt.hour();
+    let hour: u8 = hour.try_into().unwrap_or(0);
+
+    let min = dt.minute();
+    let min: u8 = min.try_into().unwrap_or(0);
+
+    let sec = dt.second();
+    let sec: u8 = sec.try_into().unwrap_or(0);
+
+    [month, day, hour, min, sec]
+}
+
+impl HandshakeTimestampPacket
+{
+    pub fn new(with_timestamp: bool) -> HandshakeTimestampPacket
+    {
+        let mut data = [0u8; 62];
+        
+        if with_timestamp 
+        { 
+            let dt = Local::now();
+            
+            data[1] = 0x01;
+            data[4..9].copy_from_slice(&format_date(&dt));
+            data[9] = 0x01;
+        }
+        HandshakeTimestampPacket { data: data }
+    }
+}
+
+impl Packet for HandshakeTimestampPacket
+{
+    fn get_hid_code(&self) -> &'static u8 { &0x11 }
+    fn get_op_code(&self) -> &'static u8 { &0x84 }
     fn get_data(&self) -> &[u8; 62] { &self.data }
 }
 
