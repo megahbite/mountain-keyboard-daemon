@@ -1,0 +1,9 @@
+[package]
+name = "mountain-driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.31"
+nusb = { version = "0.2.1", features = ["tokio"] }
+tokio = { version = "1.48.0", features = ["full"] }
