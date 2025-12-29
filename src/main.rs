@@ -1,6 +1,6 @@
 use nusb::Endpoint;
 use nusb::io::EndpointWrite;
-use nusb::{MaybeFuture, list_devices};
+use nusb::list_devices;
 use nusb::transfer::{Interrupt, Out, In};
 use tokio::sync::mpsc;
 mod api;
@@ -20,11 +20,11 @@ enum State
 
 #[tokio::main]
 async fn main() {
-    if let Ok(mut devices) = list_devices().wait() {
+    if let Ok(mut devices) = list_devices().await {
         let device_info = devices.find(|device| device.vendor_id() == MOUNTAIN_VENDOR_ID && device.product_id() == EVEREST_PRODUCT_ID).expect("Device not found");
-        println!("{:?} {:?}", device_info.product_string(), device_info.serial_number());
-        let device = device_info.open().wait().expect("Could not open device");
-        let interface = device.detach_and_claim_interface(3u8).wait().expect("Could not claim interface");
+        println!("{:?} {:?}", device_info.product_string().unwrap(), device_info.serial_number());
+        let device = device_info.open().await.expect("Could not open device");
+        let interface = device.detach_and_claim_interface(3u8).await.expect("Could not claim interface");
         let endpoint_out = interface.endpoint::<Interrupt, Out>(OUT_ENDPOINT_ADDR).expect("Couldn't get outbound endpoint");
         let endpoint_in = interface.endpoint::<Interrupt, In>(IN_ENDPOINT_ADDR).expect("Couldn't get inbound endpoint");
 
