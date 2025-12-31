@@ -5,26 +5,23 @@ use nusb::transfer::{Interrupt, Out, In};
 use tokio::sync::mpsc::{self, Sender, Receiver};
 
 mod api;
-use api::reply::{ReplyPacket, ReplyType};
+use api::reply::ReplyType;
+
+use crate::api::reply::TimeUpdateReply;
 
 const MOUNTAIN_VENDOR_ID: u16 = 0x3282;
 const EVEREST_PRODUCT_ID: u16 = 0x0001;
 const IN_ENDPOINT_ADDR: u8 = 0x84;
 const OUT_ENDPOINT_ADDR: u8 = 0x05;
 
-#[allow(dead_code)]
-enum State
-{
-    NotReady,
-    Handshake,
-    Handshook
-}
-
-enum HandshakeState
+#[derive(PartialEq, Clone)]
+enum State 
 {
     Initial,
-    WithoutTimestamp,
-    WithTimestamp
+    Idle,
+    SendHandshake,
+    CheckTimeUpdate,
+    SendTimeUpdate
 }
 
 #[tokio::main]
@@ -39,7 +36,7 @@ async fn main() {
 
         let writer = endpoint_out.writer(4096);
 
-        let (tx, rx ) = mpsc::channel::<ReplyPacket>(10);
+        let (tx, rx ) = mpsc::channel::<State>(10);
         // Read from 0x84 endpoint in a loop
         let read_task = tokio::spawn(read_task(endpoint_in, tx));
 
@@ -75,8 +72,9 @@ async fn main() {
     }
 }
 
-async fn read_task(mut endpoint_in: Endpoint<Interrupt, In>, tx: Sender<ReplyPacket>)
+async fn read_task(mut endpoint_in: Endpoint<Interrupt, In>, tx: Sender<State>)
 {
+    let mut state = State::Initial;
     let buffer = endpoint_in.allocate(64);
     // Initial read - weird quirk with keyboard is that there has to always be two open read interrupts for it to respond
     endpoint_in.submit(buffer);
@@ -89,7 +87,46 @@ async fn read_task(mut endpoint_in: Endpoint<Interrupt, In>, tx: Sender<ReplyPac
             let mut to_send = [0u8; 64];
             to_send.copy_from_slice(&result.into_vec());
             let reply = api::reply::ReplyPacket::from_buf(&to_send);
-            tx.send(reply).await.unwrap();
+            
+            let new_state = match state 
+            {
+                State::Initial => 
+                { 
+                    if reply.reply_type == ReplyType::Keepalive { State::SendHandshake }
+                    else { State::Initial }
+                }
+                State::SendHandshake =>
+                {
+                    if reply.reply_type == ReplyType::Handshake { State::CheckTimeUpdate }
+                    else { State::SendHandshake }
+                }
+                State::CheckTimeUpdate =>
+                {
+                    if reply.reply_type == ReplyType::TimeUpdate && let Ok(time_update) = TimeUpdateReply::parse_reply(reply)
+                    {
+                        if time_update.needs_update { State::SendTimeUpdate }
+                        else { State::Idle }
+                    }
+                    else { State::CheckTimeUpdate }
+                }
+                State::SendTimeUpdate =>
+                {
+                    if reply.reply_type == ReplyType::TimeUpdate && let Ok(time_update) = TimeUpdateReply::parse_reply(reply)
+                    {
+                        if time_update.update_ack { State::Idle }
+                        else { State::CheckTimeUpdate }
+                    }
+                    else { State::SendTimeUpdate }
+                }
+                _ => { State::Idle }
+            };
+
+            if state != new_state
+            {
+                let transmit_state = new_state.clone();
+                state = new_state;
+                tx.send(transmit_state).await.unwrap();
+            }
         }
     }
 }
@@ -105,92 +142,18 @@ async fn write_task(mut writer: EndpointWrite<Interrupt>, mut rx: Receiver<[u8;6
     }
 }
 
-async fn run_program(mut reply: Receiver<ReplyPacket>, transmit: Sender<[u8;64]>)
+async fn run_program(mut new_state: Receiver<State>, transmit: Sender<[u8;64]>)
 {
-    let mut state = State::NotReady;
-
     loop 
     {
-        match state
+        if let Some(state) = new_state.recv().await
         {
-            State::NotReady => 
+            match state
             {
-                if let Some(reply) = reply.recv().await
-                {
-                    if reply.reply_type == ReplyType::Keepalive
-                    {
-                        state = State::Handshake;
-                        println!("Starting handshake");
-                    }
-                }
-            },
-            State::Handshake => 
-            {
-                let mut handshake_state = HandshakeState::Initial;
-                'handshake: loop 
-                {
-                    match handshake_state
-                    {
-                        HandshakeState::Initial => 
-                        {
-                            transmit.send(api::command::build_packet(api::command::HandshakePacket::new())).await.unwrap();
-                            loop
-                            {
-                                if let Some(reply) = reply.recv().await
-                                {
-                                    if reply.reply_type == ReplyType::Handshake
-                                    {
-                                        println!("Got handshake ack!");
-                                        handshake_state = HandshakeState::WithoutTimestamp;
-                                        break;
-                                    }
-                                }
-                            }
-                        },
-                        HandshakeState::WithoutTimestamp => 
-                        {
-                            transmit.send(api::command::build_packet(api::command::HandshakeTimestampPacket::new(false))).await.unwrap();
-                            loop
-                            {
-                                if let Some(reply) = reply.recv().await
-                                {
-                                    if reply.reply_type == ReplyType::TimeUpdate
-                                    {
-                                        println!("Keyboard wants a time update");
-                                        handshake_state = HandshakeState::WithTimestamp;
-                                        break;
-                                    }
-                                }
-                            }
-                        },
-                        HandshakeState::WithTimestamp => 
-                        {
-                            transmit.send(api::command::build_packet(api::command::HandshakeTimestampPacket::new(true))).await.unwrap();
-                            loop
-                            {
-                                if let Some(reply) = reply.recv().await
-                                {
-                                    if reply.reply_type == ReplyType::TimeUpdate
-                                    {
-                                        println!("Time updated");
-                                        state = State::Handshook;
-                                        break 'handshake;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-            },
-            State::Handshook => 
-            {
-                loop
-                {
-                    if let Some(_data) = reply.recv().await
-                    {
-                    }
-                }
+                State::SendHandshake => { transmit.send(api::command::build_packet(api::command::HandshakePacket::new())).await.unwrap(); }
+                State::CheckTimeUpdate => { transmit.send(api::command::build_packet(api::command::TimestampPacket::new(false))).await.unwrap(); }
+                State::SendTimeUpdate => { transmit.send(api::command::build_packet(api::command::TimestampPacket::new(true))).await.unwrap(); }
+                _ => {}
             }
         }
     }

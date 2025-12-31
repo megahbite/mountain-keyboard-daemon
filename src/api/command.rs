@@ -34,7 +34,7 @@ impl Packet for HandshakePacket
     fn get_data(&self) -> &[u8; 62] { &self.data }
 }
 
-pub struct HandshakeTimestampPacket
+pub struct TimestampPacket
 {
     data: [u8; 62]
 }
@@ -59,9 +59,9 @@ fn format_date(dt: &DateTime<Local>) -> [u8; 5]
     [month, day, hour, min, sec]
 }
 
-impl HandshakeTimestampPacket
+impl TimestampPacket
 {
-    pub fn new(with_timestamp: bool) -> HandshakeTimestampPacket
+    pub fn new(with_timestamp: bool) -> TimestampPacket
     {
         let mut data = [0u8; 62];
         
@@ -73,11 +73,11 @@ impl HandshakeTimestampPacket
             data[4..9].copy_from_slice(&format_date(&dt));
             data[9] = 0x01;
         }
-        HandshakeTimestampPacket { data: data }
+        TimestampPacket { data: data }
     }
 }
 
-impl Packet for HandshakeTimestampPacket
+impl Packet for TimestampPacket
 {
     fn get_hid_code(&self) -> &'static u8 { &0x11 }
     fn get_op_code(&self) -> &'static u8 { &0x84 }

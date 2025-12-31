@@ -8,6 +8,11 @@ pub enum ReplyType
     TimeUpdate
 }
 
+pub enum ReplyParseError
+{
+    TypeMismatch
+}
+
 pub struct ReplyPacket 
 {
     pub reply_type: ReplyType,
@@ -36,5 +41,26 @@ impl ReplyPacket
             _ => ReplyType::Unknown
         };
         ReplyPacket{ reply_type: reply_type, data: data }
+    }
+}
+
+pub struct TimeUpdateReply
+{
+    pub needs_update: bool,
+    pub update_ack: bool
+}
+
+impl TimeUpdateReply
+{
+    pub fn parse_reply(reply: ReplyPacket) -> Result<TimeUpdateReply, ReplyParseError>
+    {
+        if reply.reply_type != ReplyType::TimeUpdate
+        {
+            Err(ReplyParseError::TypeMismatch)
+        }
+        else 
+        {
+            Ok(TimeUpdateReply { needs_update: reply.data[9] == 0x01, update_ack: reply.data[1] == 0x01 })
+        }
     }
 }
