@@ -1,0 +1,40 @@
+
+#[derive(PartialEq)]
+pub enum ReplyType
+{
+    Unknown,
+    Keepalive,
+    Handshake,
+    TimeUpdate
+}
+
+pub struct ReplyPacket 
+{
+    pub reply_type: ReplyType,
+    #[allow(dead_code)]
+    pub data: [u8; 62]
+}
+
+impl ReplyPacket
+{
+    pub fn from_buf(buf: &[u8; 64]) -> ReplyPacket
+    {
+        let mut data = [0u8; 62];
+        data.copy_from_slice(&buf[2..]);
+        let reply_type = match buf[0]
+        {
+            0x11 => 
+            {
+                match buf[1]
+                {
+                    0x14 => ReplyType::Keepalive,
+                    0x80 => ReplyType::Handshake,
+                    0x84 => ReplyType::TimeUpdate,
+                    _ => ReplyType::Unknown
+                }
+            },
+            _ => ReplyType::Unknown
+        };
+        ReplyPacket{ reply_type: reply_type, data: data }
+    }
+}
