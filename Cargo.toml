@@ -10,5 +10,6 @@ categories = ["hardware-support"]
 
 [dependencies]
 chrono = "0.4.42"
+futures-lite = "2.6.1"
 nusb = { version = "0.2.1", features = ["tokio"] }
 tokio = { version = "1.48.0", features = ["full"] }

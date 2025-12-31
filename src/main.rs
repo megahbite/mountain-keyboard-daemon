@@ -1,8 +1,13 @@
-use nusb::Endpoint;
+use futures_lite::stream::StreamExt;
+use nusb::hotplug::HotplugEvent;
+use nusb::{DeviceId, DeviceInfo, Endpoint, watch_devices};
 use nusb::io::EndpointWrite;
 use nusb::list_devices;
 use nusb::transfer::{Interrupt, Out, In};
+use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender, Receiver};
+use tokio::sync::{Mutex, Notify};
+use api::command::*;
 
 mod api;
 use api::reply::ReplyType;
@@ -26,50 +31,106 @@ enum State
 
 #[tokio::main]
 async fn main() {
-    if let Ok(mut devices) = list_devices().await {
-        let device_info = devices.find(|device| device.vendor_id() == MOUNTAIN_VENDOR_ID && device.product_id() == EVEREST_PRODUCT_ID).expect("Device not found");
-        println!("{:?} {:?}", device_info.product_string().unwrap(), device_info.serial_number());
-        let device = device_info.open().await.expect("Could not open device");
-        let interface = device.detach_and_claim_interface(3u8).await.expect("Could not claim interface");
-        let endpoint_out = interface.endpoint::<Interrupt, Out>(OUT_ENDPOINT_ADDR).expect("Couldn't get outbound endpoint");
-        let endpoint_in = interface.endpoint::<Interrupt, In>(IN_ENDPOINT_ADDR).expect("Couldn't get inbound endpoint");
+    let mut usb_watcher  = watch_devices().expect("Couldn't get USB hotplug watcher");
+    let device_id: Option<DeviceId> = None;
+    let device_id_mutex = Arc::new(Mutex::new(device_id));
+    let device_id_list_mutex = Arc::clone(&device_id_mutex);
+    
+    let (connect_tx, mut connect_rx) = mpsc::channel::<DeviceInfo>(1);
+    let connect_list_tx = connect_tx.clone();
+    let disconnect = Arc::new(Notify::new());
+    let disconnected = Arc::clone(&disconnect);
+    
+    tokio::spawn(async move
+    {        
+        let mut device_list = list_devices().await.expect("Couldn't list USB devices");
+        if let Some(device_info) = device_list.find(|device| device.vendor_id() == MOUNTAIN_VENDOR_ID && device.product_id() == EVEREST_PRODUCT_ID)
+        {
+            let mut device_id = device_id_list_mutex.lock().await;
+            *device_id = Some(device_info.id());
+            connect_list_tx.send(device_info).await.unwrap();
+        }
+    });
 
-        let writer = endpoint_out.writer(4096);
-
-        let (tx, rx ) = mpsc::channel::<State>(10);
-        // Read from 0x84 endpoint in a loop
-        let read_task = tokio::spawn(read_task(endpoint_in, tx));
-
-        let (tx_write, rx_write) = mpsc::channel::<[u8; 64]>(5);
-        
-        // Write to 0x05 endpoint from queue
-        let write_task = tokio::spawn(write_task(writer, rx_write));
-        
-        let tx_write2 = tx_write.clone();
-        // Our keepalive task
-        let keepalive_task = tokio::spawn(async move 
+    tokio::spawn(async move 
+    {
+        while let Some(event) = usb_watcher.next().await
+        {
+            match event 
             {
-                loop 
+                HotplugEvent::Connected(device_info) => 
                 {
-                    tx_write.send(api::command::build_packet(api::command::KeepalivePacket{})).await.unwrap();
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    if device_info.vendor_id() == MOUNTAIN_VENDOR_ID && device_info.product_id() == EVEREST_PRODUCT_ID
+                    {
+                        let mut device_id = device_id_mutex.lock().await;
+                        *device_id = Some(device_info.id());
+                        connect_tx.send(device_info).await.unwrap();
+                    }
+                }
+                HotplugEvent::Disconnected(disconnected_device_id) => 
+                {
+                    let device_id = device_id_mutex.lock().await;
+                    if device_id.is_some() && device_id.unwrap() == disconnected_device_id
+                    {
+                        disconnect.notify_one();
+                    }
                 }
             }
-        );
+        }
+    });
 
-        // State machine
-        let program_task = tokio::spawn(run_program(rx, tx_write2));
-
-        tokio::spawn(async move 
+    loop 
+    {
+        let my_disconnected = Arc::clone(&disconnected);
+        println!("Awaiting connection from keyboard");
+        if let Some(device_info) = connect_rx.recv().await
         {
-            tokio::signal::ctrl_c().await.unwrap();
-            println!("Cleaning up...");
-            read_task.abort();
-            write_task.abort();
-            keepalive_task.abort();
-            program_task.abort();
-        }).await.unwrap();
+            println!("Connected {}", device_info.product_string().unwrap());
+            tokio::spawn(keyboard_connected(device_info, my_disconnected)).await.unwrap();
+        }
     }
+}
+
+async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>)
+{
+    let device = device_info.open().await.expect("Could not open device");
+    let interface = device.detach_and_claim_interface(3u8).await.expect("Could not claim interface");
+    let endpoint_out = interface.endpoint::<Interrupt, Out>(OUT_ENDPOINT_ADDR).expect("Couldn't get outbound endpoint");
+    let endpoint_in = interface.endpoint::<Interrupt, In>(IN_ENDPOINT_ADDR).expect("Couldn't get inbound endpoint");
+
+    let writer = endpoint_out.writer(4096);
+
+    let (tx, rx ) = mpsc::channel::<State>(10);
+    // Read from 0x84 endpoint in a loop
+    let read_handle = tokio::spawn(read_task(endpoint_in, tx));
+
+    let (tx_write, rx_write) = mpsc::channel::<[u8; 64]>(5);
+    
+    // Write to 0x05 endpoint from queue
+    let write_handle = tokio::spawn(write_task(writer, rx_write));
+    
+    let tx_write2 = tx_write.clone();
+    // Our keepalive task
+    let keepalive_handle = tokio::spawn(async move 
+        {
+            loop 
+            {
+                tx_write.send(build_command(KeepaliveCommand{})).await.unwrap_or_else(|_| println!("Keepalive send failed"));
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        }
+    );
+
+    let program_handle = tokio::spawn(run_program(rx, tx_write2));
+
+    disconnected.notified().await;
+
+    read_handle.abort();
+    write_handle.abort();
+    keepalive_handle.abort();
+    program_handle.abort();
+
+    println!("Keyboard disconnected");
 }
 
 async fn read_task(mut endpoint_in: Endpoint<Interrupt, In>, tx: Sender<State>)
@@ -137,7 +198,7 @@ async fn write_task(mut writer: EndpointWrite<Interrupt>, mut rx: Receiver<[u8;6
     {
         if let Some(packet) = rx.recv().await
         {
-            api::command::send_packet(&packet, &mut writer).await;
+            send_command(&packet, &mut writer).await;
         }
     }
 }
@@ -150,9 +211,9 @@ async fn run_program(mut new_state: Receiver<State>, transmit: Sender<[u8;64]>)
         {
             match state
             {
-                State::SendHandshake => { transmit.send(api::command::build_packet(api::command::HandshakePacket::new())).await.unwrap(); }
-                State::CheckTimeUpdate => { transmit.send(api::command::build_packet(api::command::TimestampPacket::new(false))).await.unwrap(); }
-                State::SendTimeUpdate => { transmit.send(api::command::build_packet(api::command::TimestampPacket::new(true))).await.unwrap(); }
+                State::SendHandshake => { transmit.send(build_command(HandshakeCommand::new())).await.unwrap(); }
+                State::CheckTimeUpdate => { transmit.send(build_command(TimestampCommand::new(false))).await.unwrap(); }
+                State::SendTimeUpdate => { transmit.send(build_command(TimestampCommand::new(true))).await.unwrap(); }
                 _ => {}
             }
         }
