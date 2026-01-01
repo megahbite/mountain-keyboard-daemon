@@ -33,10 +33,10 @@ async fn main() {
     let disconnect = Arc::new(Notify::new());
     let disconnected = Arc::clone(&disconnect);
 
-    let volume_read = Arc::new(Notify::new());
-    let volume_read_requested = Arc::clone(&volume_read);
-    let (volume_tx, volume_rx) = mpsc::channel::<u8>(1);
-    let volume_rx_mut = Arc::new(Mutex::new(volume_rx));
+    #[cfg(feature = "pulse")] let volume_read = Arc::new(Notify::new());
+    #[cfg(feature = "pulse")] let volume_read_requested = Arc::clone(&volume_read);
+    #[cfg(feature = "pulse")] let (volume_tx, volume_rx) = mpsc::channel::<u8>(1);
+    #[cfg(feature = "pulse")] let volume_rx_mut = Arc::new(Mutex::new(volume_rx));
 
     #[cfg(feature = "pulse")]
     {
@@ -96,20 +96,28 @@ async fn main() {
 
     loop 
     {
-        let my_volume_request = Arc::clone(&volume_read);
         let my_disconnected = Arc::clone(&disconnected);
-        let my_volume_rx_mut = Arc::clone(&volume_rx_mut);
+        
         println!("Awaiting connection from keyboard");
         if let Some(device_info) = connect_rx.recv().await
         {
             println!("Connected {}", device_info.product_string().unwrap());
-            tokio::spawn(keyboard_connected(device_info, my_disconnected, my_volume_request, my_volume_rx_mut)).await.unwrap();
+            #[cfg(feature = "pulse")]
+            {
+                let my_volume_request = Arc::clone(&volume_read);
+                let my_volume_rx_mut = Arc::clone(&volume_rx_mut);
+                tokio::spawn(keyboard_connected(device_info, my_disconnected, my_volume_request, my_volume_rx_mut)).await.unwrap();
+            }
+            #[cfg(not(feature = "pulse"))]
+            tokio::spawn(keyboard_connected(device_info, my_disconnected)).await.unwrap();
         }
         yield_now().await;
     }
 }
 
-async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>, volume_request: Arc<Notify>, volume_rx: Arc<Mutex<Receiver<u8>>>)
+async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>, 
+    #[cfg(feature = "pulse")] volume_request: Arc<Notify>, 
+    #[cfg(feature = "pulse")] volume_rx: Arc<Mutex<Receiver<u8>>>)
 {
     let device = device_info.open().await.expect("Could not open device");
     let interface = device.detach_and_claim_interface(3u8).await.expect("Could not claim interface");
@@ -140,7 +148,10 @@ async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>, 
         }
     );
 
+    #[cfg(feature = "pulse")]
     let program_handle = tokio::spawn(run_program(rx, tx_write2, volume_request, volume_rx));
+    #[cfg(not(feature = "pulse"))]
+    let program_handle = tokio::spawn(run_program(rx, tx_write2));
 
     disconnected.notified().await;
 
@@ -192,7 +203,9 @@ async fn write_task(mut writer: EndpointWrite<Interrupt>, mut rx: Receiver<[u8;6
     }
 }
 
-async fn run_program(mut new_state: Receiver<CommandState>, transmit: Sender<[u8;64]>, volume_request: Arc<Notify>, volume_rx: Arc<Mutex<Receiver<u8>>>)
+async fn run_program(mut new_state: Receiver<CommandState>, transmit: Sender<[u8;64]>, 
+    #[cfg(feature = "pulse")] volume_request: Arc<Notify>, 
+    #[cfg(feature = "pulse")] volume_rx: Arc<Mutex<Receiver<u8>>>)
 {
     loop 
     {

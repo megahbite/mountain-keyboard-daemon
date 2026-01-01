@@ -5,7 +5,13 @@ Adds extended support for Mountain Everest keyboard accessories on Linux.
 
 Install a Rust development environment for your distro/OS
 
+### With PulseAudio based volume syncing
+
 Build with `cargo build -r`
+
+### Without
+
+Build with `cargo build -r --no-default-features`
 
 ## Installation
 

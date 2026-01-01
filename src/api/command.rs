@@ -95,11 +95,13 @@ impl Command for KeepaliveCommand
     fn get_data(&self) -> &[u8; 62] { &[0;62] }
 }
 
+#[allow(dead_code)]
 pub struct VolumeCommand
 {
     data: [u8; 62]
 }
 
+#[allow(dead_code)]
 impl VolumeCommand
 {
     pub fn new(volume: u8) -> VolumeCommand
