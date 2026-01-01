@@ -30,6 +30,7 @@
             This has not occurred in all the packet dumps I have captured so it's triggered by something.
 
         * I had a look at a capture of when a macro is triggered and interestingly, instead of the keyboard replying with the FF:AA:FF, it instead replied with the macro string with a 0x02 op. code. It was spread over two replies which might explain the quirk with always needing two interrupts in flight. I need to check what the limit of the macro length is.
+        * The fifth byte of the 0x14 data gives the display dial's current state. 0x1n values are related to the clock, 0x2n to profiles, 0x3n to lighting etc. This can be used to drive the state of the daemon.
 
     * An initial handshake seems to occur like so:
         

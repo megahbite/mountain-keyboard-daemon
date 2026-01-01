@@ -7,27 +7,19 @@ use nusb::transfer::{Interrupt, Out, In};
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender, Receiver};
 use tokio::sync::{Mutex, Notify};
-use api::command::*;
+use tokio::task::yield_now;
 
 mod api;
-use api::reply::ReplyType;
+use api::command::*;
+use api::reply::*;
 
-use crate::api::reply::TimeUpdateReply;
+#[cfg(feature = "pulse")]
+mod pulse;
 
 const MOUNTAIN_VENDOR_ID: u16 = 0x3282;
 const EVEREST_PRODUCT_ID: u16 = 0x0001;
 const IN_ENDPOINT_ADDR: u8 = 0x84;
 const OUT_ENDPOINT_ADDR: u8 = 0x05;
-
-#[derive(PartialEq, Clone)]
-enum State 
-{
-    Initial,
-    Idle,
-    SendHandshake,
-    CheckTimeUpdate,
-    SendTimeUpdate
-}
 
 #[tokio::main]
 async fn main() {
@@ -40,6 +32,29 @@ async fn main() {
     let connect_list_tx = connect_tx.clone();
     let disconnect = Arc::new(Notify::new());
     let disconnected = Arc::clone(&disconnect);
+
+    let volume_read = Arc::new(Notify::new());
+    let volume_read_requested = Arc::clone(&volume_read);
+    let (volume_tx, volume_rx) = mpsc::channel::<u8>(1);
+    let volume_rx_mut = Arc::new(Mutex::new(volume_rx));
+
+    #[cfg(feature = "pulse")]
+    {
+        use std::thread;
+
+        thread::spawn(move || 
+        {
+            let mut pulse = pulse::Pulse::new();
+            if !pulse.ready { pulse.wait_until_ready(); }
+            loop
+            {
+                use futures_lite::future::block_on;
+
+                block_on(volume_read_requested.notified());
+                volume_tx.blocking_send(pulse.get_volume()).unwrap();
+            }
+        });
+    }
     
     tokio::spawn(async move
     {        
@@ -81,17 +96,20 @@ async fn main() {
 
     loop 
     {
+        let my_volume_request = Arc::clone(&volume_read);
         let my_disconnected = Arc::clone(&disconnected);
+        let my_volume_rx_mut = Arc::clone(&volume_rx_mut);
         println!("Awaiting connection from keyboard");
         if let Some(device_info) = connect_rx.recv().await
         {
             println!("Connected {}", device_info.product_string().unwrap());
-            tokio::spawn(keyboard_connected(device_info, my_disconnected)).await.unwrap();
+            tokio::spawn(keyboard_connected(device_info, my_disconnected, my_volume_request, my_volume_rx_mut)).await.unwrap();
         }
+        yield_now().await;
     }
 }
 
-async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>)
+async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>, volume_request: Arc<Notify>, volume_rx: Arc<Mutex<Receiver<u8>>>)
 {
     let device = device_info.open().await.expect("Could not open device");
     let interface = device.detach_and_claim_interface(3u8).await.expect("Could not claim interface");
@@ -100,7 +118,7 @@ async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>)
 
     let writer = endpoint_out.writer(4096);
 
-    let (tx, rx ) = mpsc::channel::<State>(10);
+    let (tx, rx ) = mpsc::channel::<CommandState>(10);
     // Read from 0x84 endpoint in a loop
     let read_handle = tokio::spawn(read_task(endpoint_in, tx));
 
@@ -117,11 +135,12 @@ async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>)
             {
                 tx_write.send(build_command(KeepaliveCommand{})).await.unwrap_or_else(|_| println!("Keepalive send failed"));
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                yield_now().await;
             }
         }
     );
 
-    let program_handle = tokio::spawn(run_program(rx, tx_write2));
+    let program_handle = tokio::spawn(run_program(rx, tx_write2, volume_request, volume_rx));
 
     disconnected.notified().await;
 
@@ -133,9 +152,10 @@ async fn keyboard_connected(device_info: DeviceInfo, disconnected: Arc<Notify>)
     println!("Keyboard disconnected");
 }
 
-async fn read_task(mut endpoint_in: Endpoint<Interrupt, In>, tx: Sender<State>)
+async fn read_task(mut endpoint_in: Endpoint<Interrupt, In>, tx: Sender<CommandState>)
 {
-    let mut state = State::Initial;
+    let mut initialised = false;
+    let mut last_display_state = DisplayState::Unknown;
     let buffer = endpoint_in.allocate(64);
     // Initial read - weird quirk with keyboard is that there has to always be two open read interrupts for it to respond
     endpoint_in.submit(buffer);
@@ -148,47 +168,15 @@ async fn read_task(mut endpoint_in: Endpoint<Interrupt, In>, tx: Sender<State>)
             let mut to_send = [0u8; 64];
             to_send.copy_from_slice(&result.into_vec());
             let reply = api::reply::ReplyPacket::from_buf(&to_send);
-            
-            let new_state = match state 
-            {
-                State::Initial => 
-                { 
-                    if reply.reply_type == ReplyType::Keepalive { State::SendHandshake }
-                    else { State::Initial }
-                }
-                State::SendHandshake =>
-                {
-                    if reply.reply_type == ReplyType::Handshake { State::CheckTimeUpdate }
-                    else { State::SendHandshake }
-                }
-                State::CheckTimeUpdate =>
-                {
-                    if reply.reply_type == ReplyType::TimeUpdate && let Ok(time_update) = TimeUpdateReply::parse_reply(reply)
-                    {
-                        if time_update.needs_update { State::SendTimeUpdate }
-                        else { State::Idle }
-                    }
-                    else { State::CheckTimeUpdate }
-                }
-                State::SendTimeUpdate =>
-                {
-                    if reply.reply_type == ReplyType::TimeUpdate && let Ok(time_update) = TimeUpdateReply::parse_reply(reply)
-                    {
-                        if time_update.update_ack { State::Idle }
-                        else { State::CheckTimeUpdate }
-                    }
-                    else { State::SendTimeUpdate }
-                }
-                _ => { State::Idle }
-            };
 
-            if state != new_state
+            let command_state = handle_reply(reply, &mut initialised, &mut last_display_state);
+
+            if command_state != CommandState::Idle
             {
-                let transmit_state = new_state.clone();
-                state = new_state;
-                tx.send(transmit_state).await.unwrap();
+                tx.send(command_state).await.unwrap();
             }
         }
+        yield_now().await;
     }
 }
 
@@ -200,10 +188,11 @@ async fn write_task(mut writer: EndpointWrite<Interrupt>, mut rx: Receiver<[u8;6
         {
             send_command(&packet, &mut writer).await;
         }
+        yield_now().await;
     }
 }
 
-async fn run_program(mut new_state: Receiver<State>, transmit: Sender<[u8;64]>)
+async fn run_program(mut new_state: Receiver<CommandState>, transmit: Sender<[u8;64]>, volume_request: Arc<Notify>, volume_rx: Arc<Mutex<Receiver<u8>>>)
 {
     loop 
     {
@@ -211,11 +200,23 @@ async fn run_program(mut new_state: Receiver<State>, transmit: Sender<[u8;64]>)
         {
             match state
             {
-                State::SendHandshake => { transmit.send(build_command(HandshakeCommand::new())).await.unwrap(); }
-                State::CheckTimeUpdate => { transmit.send(build_command(TimestampCommand::new(false))).await.unwrap(); }
-                State::SendTimeUpdate => { transmit.send(build_command(TimestampCommand::new(true))).await.unwrap(); }
+                CommandState::SendHandshake => { transmit.send(build_command(HandshakeCommand::new())).await.unwrap(); }
+                CommandState::CheckTimeUpdate => { transmit.send(build_command(TimestampCommand::new(false))).await.unwrap(); }
+                CommandState::SendTimeUpdate => { transmit.send(build_command(TimestampCommand::new(true))).await.unwrap(); }
+                CommandState::SendVolume => 
+                {
+                    #[cfg(feature = "pulse")]
+                    {
+                        volume_request.notify_one();
+                        if let Some(volume) = volume_rx.lock().await.recv().await
+                        {
+                            transmit.send(build_command(VolumeCommand::new(volume))).await.unwrap();
+                        }
+                    }
+                }
                 _ => {}
             }
         }
+        yield_now().await;
     }
 }
